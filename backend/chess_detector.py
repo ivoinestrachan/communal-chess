@@ -19,9 +19,14 @@ logger = logging.getLogger(__name__)
 BOARD_FLIPPED = os.environ.get('CHESS_BOARD_FLIPPED', '1') == '1'
 
 # Path to the YOLO chess-piece detection model. Downloaded once during setup.
+# Default to the larger yolov8m model (52MB) — better recall than yolo11n on
+# unusual boards, at the cost of ~3x inference time. Override via env if needed.
+_default_model = 'chess_yolo_m.pt' if os.path.exists(
+    os.path.join(os.path.dirname(__file__), 'chess_yolo_m.pt')
+) else 'chess_yolo.pt'
 YOLO_MODEL_PATH = os.environ.get(
     'CHESS_YOLO_MODEL',
-    os.path.join(os.path.dirname(__file__), 'chess_yolo.pt')
+    os.path.join(os.path.dirname(__file__), _default_model)
 )
 
 # Class labels for board state representation
@@ -59,7 +64,7 @@ class YOLOPieceDetector:
                 self._class_to_color[idx] = EMPTY  # unexpected class
         logger.info(f"YOLO chess model loaded with {len(self.names)} classes")
 
-    def predict_board(self, warped_board: np.ndarray, conf: float = 0.35) -> np.ndarray:
+    def predict_board(self, warped_board: np.ndarray, conf: float = 0.2) -> np.ndarray:
         """Run YOLO on the warped 800x800 board and return an 8x8 array of
         {EMPTY, WHITE, BLACK} indicating piece color per square.
 
