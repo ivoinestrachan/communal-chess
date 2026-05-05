@@ -19,6 +19,12 @@ export default function ChessGame() {
   const [detectionActive, setDetectionActive] = useState(false);
   const socketRef = useRef<Socket | null>(null);
   const videoRef = useRef<HTMLImageElement>(null);
+  const gameRef = useRef(game);
+
+  // Keep gameRef in sync with game state for use in async/socket handlers
+  useEffect(() => {
+    gameRef.current = game;
+  }, [game]);
 
   // Fetch available cameras on mount
   useEffect(() => {
@@ -53,9 +59,9 @@ export default function ChessGame() {
       setConnected(false);
     });
 
-    socket.on('move_detected', (data: { from: string; to: string }) => {
+    socket.on('move_detected', (data: { from: string; to: string; color?: 'white' | 'black' }) => {
       console.log('Move detected:', data);
-      makeExternalMove(data.from, data.to);
+      makeExternalMove(data.from, data.to, undefined, data.color);
     });
 
     return () => {
@@ -129,29 +135,39 @@ export default function ChessGame() {
   }
 
   // Function to handle external moves from the camera detection
-  function makeExternalMove(from: string, to: string, promotion?: string) {
-    try {
-      const gameCopy = new Chess(game.fen());
-      const move = gameCopy.move({
-        from,
-        to,
-        promotion: promotion || 'q',
-      });
-
-      if (move) {
-        setGame(gameCopy);
-        setMoveHistory(prev => [...prev, move.san]);
-
-        // Update status with the new game state
-        updateGameStatus(gameCopy);
-
-        return true;
+  function makeExternalMove(from: string, to: string, promotion?: string, detectedColor?: 'white' | 'black') {
+    // Read from ref so socket-handler closure sees up-to-date game state
+    const currentGame = gameRef.current;
+    const turn = currentGame.turn(); // 'w' or 'b'
+    const tryMove = (a: string, b: string) => {
+      const copy = new Chess(currentGame.fen());
+      try {
+        const result = copy.move({ from: a, to: b, promotion: promotion || 'q' });
+        return result ? { copy, san: result.san } : null;
+      } catch {
+        return null;
       }
-      return false;
-    } catch (error) {
-      console.error('External move error:', error);
-      return false;
+    };
+
+    // If the detected piece color disagrees with whose turn it is, the camera's
+    // from/to is almost certainly wrong (variance heuristic flipped). Try swapped first.
+    const colorMismatch = detectedColor && (
+      (detectedColor === 'white' && turn === 'b') ||
+      (detectedColor === 'black' && turn === 'w')
+    );
+
+    let applied = colorMismatch
+      ? (tryMove(to, from) ?? tryMove(from, to))
+      : (tryMove(from, to) ?? tryMove(to, from));
+
+    if (!applied) {
+      console.warn(`Detected move ${from}-${to} (piece=${detectedColor ?? 'unknown'}) is not legal; turn=${turn === 'w' ? 'white' : 'black'}`);
+      return;
     }
+    gameRef.current = applied.copy;
+    setGame(applied.copy);
+    setMoveHistory(prev => [...prev, applied.san]);
+    updateGameStatus(applied.copy);
   }
 
   function resetGame() {
@@ -468,8 +484,10 @@ export default function ChessGame() {
         }}>
           <div style={{ width: '100%', maxWidth: 'min(90vh, 1000px)' }}>
             <Chessboard
-              position={game.fen()}
-              onPieceDrop={onDrop}
+              options={{
+                position: game.fen(),
+                onPieceDrop: onDrop,
+              }}
             />
           </div>
         </div>
@@ -792,36 +810,68 @@ export default function ChessGame() {
                     Stop Camera
                   </button>
                   {!calibrated ? (
-                    <button
-                      onClick={calibrateBoard}
-                      style={{
-                        padding: '0.5rem',
-                        backgroundColor: '#ff9944',
-                        color: 'white',
-                        border: 'none',
-                        borderRadius: '4px',
-                        cursor: 'pointer',
-                        fontSize: '0.9rem'
-                      }}
-                    >
-                      Calibrate Board
-                    </button>
+                    <>
+                      <button
+                        onClick={calibrateBoard}
+                        style={{
+                          padding: '0.5rem',
+                          backgroundColor: '#ff9944',
+                          color: 'white',
+                          border: 'none',
+                          borderRadius: '4px',
+                          cursor: 'pointer',
+                          fontSize: '0.9rem'
+                        }}
+                      >
+                        Auto Calibrate
+                      </button>
+                      <button
+                        onClick={() => { setManualCalibrationMode(true); setCalibrationCorners([]); }}
+                        style={{
+                          padding: '0.5rem',
+                          backgroundColor: '#9966ff',
+                          color: 'white',
+                          border: 'none',
+                          borderRadius: '4px',
+                          cursor: 'pointer',
+                          fontSize: '0.9rem'
+                        }}
+                      >
+                        Manual Calibrate
+                      </button>
+                    </>
                   ) : (
-                    <button
-                      onClick={startDetection}
-                      style={{
-                        padding: '0.5rem',
-                        backgroundColor: '#44ff44',
-                        color: 'black',
-                        border: 'none',
-                        borderRadius: '4px',
-                        cursor: 'pointer',
-                        fontSize: '0.9rem',
-                        fontWeight: 'bold'
-                      }}
-                    >
-                      Start Auto-Detection
-                    </button>
+                    <>
+                      <button
+                        onClick={startDetection}
+                        style={{
+                          padding: '0.5rem',
+                          backgroundColor: '#44ff44',
+                          color: 'black',
+                          border: 'none',
+                          borderRadius: '4px',
+                          cursor: 'pointer',
+                          fontSize: '0.9rem',
+                          fontWeight: 'bold'
+                        }}
+                      >
+                        Start Auto-Detection
+                      </button>
+                      <button
+                        onClick={() => { setCalibrated(false); setManualCalibrationMode(true); setCalibrationCorners([]); }}
+                        style={{
+                          padding: '0.5rem',
+                          backgroundColor: '#9966ff',
+                          color: 'white',
+                          border: 'none',
+                          borderRadius: '4px',
+                          cursor: 'pointer',
+                          fontSize: '0.9rem'
+                        }}
+                      >
+                        Recalibrate
+                      </button>
+                    </>
                   )}
                 </>
               )}

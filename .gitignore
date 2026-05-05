@@ -39,3 +39,19 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# python backend
+backend/venv/
+backend/__pycache__/
+backend/**/__pycache__/
+*.pyc
+*.pyo
+
+# model weights / large artifacts
+backend/*.pt
+backend/models/
+*.pt
+*.onnx
+
+# debug/test outputs
+/tmp/warped_board*.png

@@ -5,11 +5,204 @@ Detects chess piece movements from a camera feed in real-time
 
 import cv2
 import numpy as np
+import os
 from typing import Dict, List, Tuple, Optional
 import logging
+from sklearn.neighbors import KNeighborsClassifier
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Set CHESS_BOARD_FLIPPED=1 if your camera sees white at the top of the image
+# (camera is on the white player's side). When flipped, square labels are
+# rotated 180 degrees so detected moves match standard chess notation.
+BOARD_FLIPPED = os.environ.get('CHESS_BOARD_FLIPPED', '1') == '1'
+
+# Path to the YOLO chess-piece detection model. Downloaded once during setup.
+YOLO_MODEL_PATH = os.environ.get(
+    'CHESS_YOLO_MODEL',
+    os.path.join(os.path.dirname(__file__), 'chess_yolo.pt')
+)
+
+# Class labels for board state representation
+EMPTY = 0
+WHITE = 1
+BLACK = 2
+
+
+class YOLOPieceDetector:
+    """Wraps a pretrained YOLO chess-piece detector and exposes a method that
+    returns an 8x8 array of {EMPTY, WHITE, BLACK} for a warped board image.
+
+    The model has 12 classes (white_pawn, white_knight, ..., black_king); we
+    collapse to white/black/empty for the move-detection diff. SAN, captures,
+    promotion, etc. are still handled by chess.js on the frontend.
+    """
+
+    def __init__(self, model_path: str = YOLO_MODEL_PATH) -> None:
+        from ultralytics import YOLO  # local import: torch is heavy
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(
+                f"YOLO chess model not found at {model_path}. "
+                f"Download it from HuggingFace (yamero999/chess-piece-detection-yolo11n)."
+            )
+        self.model = YOLO(model_path)
+        self.names: Dict[int, str] = self.model.names
+        # Pre-compute color per class index so per-frame inference is fast
+        self._class_to_color: Dict[int, int] = {}
+        for idx, name in self.names.items():
+            if name.startswith('white_'):
+                self._class_to_color[idx] = WHITE
+            elif name.startswith('black_'):
+                self._class_to_color[idx] = BLACK
+            else:
+                self._class_to_color[idx] = EMPTY  # unexpected class
+        logger.info(f"YOLO chess model loaded with {len(self.names)} classes")
+
+    def predict_board(self, warped_board: np.ndarray, conf: float = 0.35) -> np.ndarray:
+        """Run YOLO on the warped 800x800 board and return an 8x8 array of
+        {EMPTY, WHITE, BLACK} indicating piece color per square.
+
+        Each detection is snapped to its nearest grid square by box center.
+        If multiple detections fall in the same square (rare), the highest-
+        confidence one wins.
+        """
+        results = self.model(warped_board, conf=conf, verbose=False)
+        board = np.full((8, 8), EMPTY, dtype=np.int8)
+        if not results:
+            return board
+        boxes = results[0].boxes
+        if boxes is None or len(boxes) == 0:
+            return board
+
+        sq = warped_board.shape[0] // 8
+        # Track best confidence per square so a stronger detection wins
+        best_conf = np.zeros((8, 8), dtype=np.float32)
+
+        for box in boxes:
+            cls = int(box.cls.item())
+            conf_score = float(box.conf.item())
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            cx = (x1 + x2) / 2.0
+            cy = (y1 + y2) / 2.0
+            col = int(cx // sq)
+            row = int(cy // sq)
+            if not (0 <= row < 8 and 0 <= col < 8):
+                continue
+            color = self._class_to_color.get(cls, EMPTY)
+            if conf_score > best_conf[row, col]:
+                best_conf[row, col] = conf_score
+                board[row, col] = color
+
+        return board
+
+
+def extract_square_features(square_img: np.ndarray) -> np.ndarray:
+    """Extract a fixed-length feature vector describing one chess square's contents.
+    Used by both training (during calibration) and inference (per scan).
+    """
+    if square_img.size == 0:
+        return np.zeros(11, dtype=np.float32)
+
+    gray = cv2.cvtColor(square_img, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(square_img, cv2.COLOR_BGR2HSV)
+    h, w = gray.shape
+
+    # Center patch (where the piece body sits)
+    cy0, cy1 = h // 3, 2 * h // 3
+    cx0, cx1 = w // 3, 2 * w // 3
+    center = gray[cy0:cy1, cx0:cx1]
+
+    # Edge ring (approximation: outer 1/4 frame, where the square color shows
+    # even when a piece is centered)
+    edge_mask = np.ones_like(gray, dtype=bool)
+    edge_mask[h // 4:3 * h // 4, w // 4:3 * w // 4] = False
+    edge_pixels = gray[edge_mask]
+
+    edges = cv2.Canny(gray, 50, 150)
+
+    return np.array([
+        float(np.mean(gray)),               # overall brightness
+        float(np.std(gray)),                # overall texture
+        float(np.mean(square_img[..., 0])), # mean blue
+        float(np.mean(square_img[..., 1])), # mean green
+        float(np.mean(square_img[..., 2])), # mean red
+        float(np.mean(hsv[..., 1])),        # saturation
+        float(np.sum(edges > 0) / edges.size),  # edge density
+        float(np.mean(center)),             # center brightness (piece top)
+        float(np.std(center)),              # center texture
+        float(np.mean(edge_pixels)),        # surrounding-square brightness
+        float(np.mean(center) - np.mean(edge_pixels)),  # piece-vs-square contrast
+    ], dtype=np.float32)
+
+
+class PieceClassifier:
+    """Trains a kNN classifier at calibration time using the 64 squares of a
+    starting-position board as labeled examples (32 white in rows 1-2,
+    32 black in rows 7-8, 32 empty in rows 3-6). After training,
+    predict_board() returns an 8x8 array of {EMPTY, WHITE, BLACK} per scan.
+    """
+
+    def __init__(self) -> None:
+        self.model: Optional[KNeighborsClassifier] = None
+
+    def train_from_starting_position(self, warped_board: np.ndarray) -> None:
+        sq = warped_board.shape[0] // 8
+        features: list[np.ndarray] = []
+        labels: list[int] = []
+        # In the warped image (camera-frame coords), `row` 0 is at the top of
+        # the image. With BOARD_FLIPPED=1, white sits at the top of the image,
+        # so warped rows 0-1 = white pieces, 6-7 = black pieces, 2-5 = empty.
+        if BOARD_FLIPPED:
+            white_rows = (0, 1)
+            black_rows = (6, 7)
+        else:
+            white_rows = (6, 7)
+            black_rows = (0, 1)
+
+        for row in range(8):
+            for col in range(8):
+                patch = warped_board[row * sq:(row + 1) * sq, col * sq:(col + 1) * sq]
+                if row in white_rows:
+                    label = WHITE
+                elif row in black_rows:
+                    label = BLACK
+                else:
+                    label = EMPTY
+                features.append(extract_square_features(patch))
+                labels.append(label)
+
+        X = np.stack(features)
+        y = np.array(labels)
+        # Standardize for kNN distance fairness
+        self._mean = X.mean(axis=0)
+        self._std = X.std(axis=0) + 1e-6
+        Xn = (X - self._mean) / self._std
+
+        self.model = KNeighborsClassifier(n_neighbors=3, weights='distance')
+        self.model.fit(Xn, y)
+        logger.info(
+            f"PieceClassifier trained on {len(y)} samples "
+            f"({(y == WHITE).sum()} white, {(y == BLACK).sum()} black, {(y == EMPTY).sum()} empty)"
+        )
+
+    def predict_board(self, warped_board: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Returns (predictions, confidences) — both 8x8 arrays.
+        Confidences are in [0, 1]; values near 1 mean kNN was unanimous."""
+        if self.model is None:
+            raise RuntimeError("Classifier not trained. Call train_from_starting_position first.")
+        sq = warped_board.shape[0] // 8
+        feats = []
+        for row in range(8):
+            for col in range(8):
+                patch = warped_board[row * sq:(row + 1) * sq, col * sq:(col + 1) * sq]
+                feats.append(extract_square_features(patch))
+        X = np.stack(feats)
+        Xn = (X - self._mean) / self._std
+        proba = self.model.predict_proba(Xn)  # (64, n_classes)
+        preds = self.model.classes_[np.argmax(proba, axis=1)]
+        confs = np.max(proba, axis=1)
+        return preds.reshape(8, 8), confs.reshape(8, 8)
 
 
 class ChessBoardDetector:
@@ -22,6 +215,24 @@ class ChessBoardDetector:
         self.previous_board_state = None
         self.current_board_state = None
         self.square_size = None
+        # Diff-based detection state
+        self.reference_squares: Optional[np.ndarray] = None  # (8, 8, sq, sq) grayscale ref
+        self._pending_change: Optional[Tuple[int, int]] = None  # (changed_count, frame_idx) — unused, see _change_streak
+        self._change_streak: Dict[Tuple[int, int], int] = {}  # square -> consecutive-frames-changed
+        # Detection: YOLO if model is available, else fall back to per-square kNN.
+        self.yolo_detector: Optional[YOLOPieceDetector] = None
+        if os.path.exists(YOLO_MODEL_PATH):
+            try:
+                self.yolo_detector = YOLOPieceDetector()
+                logger.info("Using YOLO chess piece detector")
+            except Exception as e:
+                logger.warning(f"YOLO model load failed, falling back to kNN: {e}")
+        self.classifier = PieceClassifier()
+        self.previous_classes: Optional[np.ndarray] = None  # 8x8 of {EMPTY, WHITE, BLACK}
+        # Stability gate: only emit a move when the predicted board has been
+        # consistent for N consecutive scans. Prevents transient misclassification flicker.
+        self._candidate_classes: Optional[np.ndarray] = None
+        self._candidate_streak: int = 0
 
     def detect_board_corners(self, frame: np.ndarray) -> Optional[np.ndarray]:
         """
@@ -63,14 +274,23 @@ class ChessBoardDetector:
                 for epsilon_mult in [0.01, 0.02, 0.03, 0.04, 0.05]:
                     approx = cv2.approxPolyDP(contour, epsilon_mult * peri, True)
                     if len(approx) == 4:
-                        # Check if it's roughly square-shaped
-                        (x, y, w, h) = cv2.boundingRect(approx)
-                        aspect_ratio = w / float(h) if h > 0 else 0
-                        if 0.7 < aspect_ratio < 1.3:  # Allow some tolerance
-                            valid_contours.append((area, approx))
+                        # Use minAreaRect so rotated boards still register as square
+                        rect = cv2.minAreaRect(approx)
+                        (rw, rh) = rect[1]
+                        if rw <= 0 or rh <= 0:
+                            continue
+                        rotated_aspect = max(rw, rh) / min(rw, rh)
+                        rotated_area = rw * rh
+                        # Fill ratio: real boards fill their rotated bbox tightly
+                        fill_ratio = area / rotated_area if rotated_area > 0 else 0
+                        if rotated_aspect < 1.25 and fill_ratio > 0.85:
+                            # Score = how "square + filled" it is, weighted by area
+                            squareness = 1.0 / rotated_aspect
+                            score = area * squareness * fill_ratio
+                            valid_contours.append((score, approx))
                             break
 
-        # Return largest valid quadrilateral
+        # Return best-scoring valid quadrilateral
         if valid_contours:
             valid_contours.sort(reverse=True, key=lambda x: x[0])
             return valid_contours[0][1].reshape(4, 2)
@@ -240,6 +460,311 @@ class ChessBoardDetector:
 
         return score >= 3
 
+    def _split_squares(self, warped_board: np.ndarray) -> np.ndarray:
+        """Split the warped board into 8x8 grayscale squares. Returns (8, 8, sq, sq)."""
+        gray = cv2.cvtColor(warped_board, cv2.COLOR_BGR2GRAY)
+        sq = gray.shape[0] // 8
+        squares = np.zeros((8, 8, sq, sq), dtype=np.uint8)
+        for row in range(8):
+            for col in range(8):
+                squares[row, col] = gray[row * sq:(row + 1) * sq, col * sq:(col + 1) * sq]
+        return squares
+
+    def set_reference(self, warped_board: np.ndarray) -> None:
+        """Calibrate from the warped starting-position board. With YOLO available,
+        we just snapshot the YOLO prediction. Without YOLO, we train the kNN
+        classifier on the 32 piece + 32 empty squares.
+        """
+        if self.yolo_detector is not None:
+            # YOLO needs no training; just snapshot the current board state
+            self.previous_classes = self.yolo_detector.predict_board(warped_board)
+        else:
+            self.classifier.train_from_starting_position(warped_board)
+            preds, _ = self.classifier.predict_board(warped_board)
+            self.previous_classes = preds
+
+        self._candidate_classes = None
+        self._candidate_streak = 0
+        self._scan_counter = 0
+        # Keep diff-based reference too, for any legacy paths still using it.
+        self.reference_squares = self._split_squares(warped_board)
+        self._change_streak = {}
+        logger.info(
+            f"Calibrated. Detector sees: "
+            f"{(self.previous_classes == WHITE).sum()} white, "
+            f"{(self.previous_classes == BLACK).sum()} black, "
+            f"{(self.previous_classes == EMPTY).sum()} empty squares"
+        )
+        logger.info(f"Initial board state:\n{self._format_board(self.previous_classes)}")
+
+    def detect_move_classified(
+        self,
+        warped_board: np.ndarray,
+        confirm_frames: int = 2,
+        confidence_threshold: float = 0.6,
+    ) -> Optional[Dict[str, str]]:
+        """Detect a move by predicting the full board state per frame and
+        diffing against the last known state. Uses YOLO when available, kNN
+        otherwise. Robust to lighting drift because predictions are absolute,
+        not against a temporal reference.
+        """
+        if self.previous_classes is None:
+            return None
+
+        if self.yolo_detector is not None:
+            current_classes = self.yolo_detector.predict_board(warped_board)
+        else:
+            raw_preds, confs = self.classifier.predict_board(warped_board)
+            current_classes = np.where(confs >= confidence_threshold, raw_preds, self.previous_classes)
+
+        # Periodic state log so we can see the detector's view if things go wrong.
+        self._scan_counter = getattr(self, '_scan_counter', 0) + 1
+        if self._scan_counter % 20 == 0:
+            logger.info(
+                f"Detector state (scan #{self._scan_counter}):\n"
+                + self._format_board(current_classes)
+            )
+
+        # Stability gate
+        if self._candidate_classes is None or not np.array_equal(self._candidate_classes, current_classes):
+            self._candidate_classes = current_classes
+            self._candidate_streak = 1
+            return None
+        self._candidate_streak += 1
+        if self._candidate_streak < confirm_frames:
+            return None
+
+        # Stable. Compare to last known position.
+        if np.array_equal(current_classes, self.previous_classes):
+            return None  # No change
+
+        files = 'abcdefgh'
+
+        def _label(row: int, col: int) -> str:
+            if BOARD_FLIPPED:
+                return f"{files[7 - col]}{row + 1}"
+            return f"{files[col]}{8 - row}"
+
+        diff_squares = [
+            (r, c, int(self.previous_classes[r, c]), int(current_classes[r, c]))
+            for r in range(8) for c in range(8)
+            if self.previous_classes[r, c] != current_classes[r, c]
+        ]
+
+        # Try to identify the move from the diff
+        move = self._reduce_diff_to_move(diff_squares, _label)
+        if move is None:
+            return None
+
+        # Commit the new state
+        self.previous_classes = current_classes
+        self._candidate_classes = None
+        self._candidate_streak = 0
+        logger.info(
+            f"Classified move: {move['from']} -> {move['to']} (piece={move.get('color')}, "
+            f"diff_squares={len(diff_squares)})"
+        )
+        return move
+
+    @staticmethod
+    def _format_board(classes: np.ndarray) -> str:
+        symbols = {EMPTY: '.', WHITE: 'W', BLACK: 'B'}
+        return '\n'.join(' '.join(symbols[int(classes[r, c])] for c in range(8)) for r in range(8))
+
+    def _reduce_diff_to_move(self, diff_squares, label_fn) -> Optional[Dict[str, str]]:
+        """Convert a list of (row, col, prev_class, curr_class) tuples into a
+        {from, to, color} move dict. Handles plain moves (2 squares), captures
+        (2 squares with color change), castling (4 squares — pick the king),
+        and en passant (3 squares — pick the pawn move).
+        Returns None if the diff doesn't look like any single legal move pattern.
+        """
+        if len(diff_squares) == 0:
+            return None
+
+        # Helper: find a square that gained a piece of given color
+        def gained(color):
+            return [(r, c, p, n) for r, c, p, n in diff_squares if p == EMPTY and n == color]
+
+        # Helper: find a square that lost a piece of given color
+        def lost(color):
+            return [(r, c, p, n) for r, c, p, n in diff_squares if p == color and n == EMPTY]
+
+        # Helper: find a square where one color was replaced by another (capture target)
+        def replaced(from_color, to_color):
+            return [(r, c, p, n) for r, c, p, n in diff_squares
+                    if p == from_color and n == to_color]
+
+        for color in (WHITE, BLACK):
+            other = BLACK if color == WHITE else WHITE
+            color_str = 'white' if color == WHITE else 'black'
+
+            # Plain move: piece of `color` left one square, arrived at an empty one.
+            l = lost(color)
+            g = gained(color)
+            if len(l) == 1 and len(g) == 1 and len(diff_squares) == 2:
+                fr = l[0]
+                to = g[0]
+                return {
+                    'from': label_fn(fr[0], fr[1]),
+                    'to': label_fn(to[0], to[1]),
+                    'color': color_str,
+                }
+
+            # Capture: piece of `color` left one square, replaced opponent on another.
+            r = replaced(other, color)
+            if len(l) == 1 and len(r) == 1 and len(diff_squares) == 2:
+                fr = l[0]
+                to = r[0]
+                return {
+                    'from': label_fn(fr[0], fr[1]),
+                    'to': label_fn(to[0], to[1]),
+                    'color': color_str,
+                }
+
+            # Castling: king + rook both move. 4 squares change, all on same rank.
+            # We emit the king move (e1->g1 or e1->c1, on the back rank); chess.js
+            # auto-handles the rook leg.
+            if len(diff_squares) == 4 and len(l) == 2 and len(g) == 2:
+                rows = {r for r, _, _, _ in diff_squares}
+                if len(rows) == 1:
+                    # All on same rank. Find the e-file mover (king starts there)
+                    e_col = 4
+                    king_loss = next((s for s in l if s[1] == e_col), None)
+                    if king_loss is not None:
+                        # King goes to col 6 (kingside) or col 2 (queenside)
+                        king_dest = next((s for s in g if s[1] in (2, 6)), None)
+                        if king_dest is not None:
+                            return {
+                                'from': label_fn(king_loss[0], king_loss[1]),
+                                'to': label_fn(king_dest[0], king_dest[1]),
+                                'color': color_str,
+                            }
+
+            # En passant: 3 squares change. Capturing pawn (color) goes from one
+            # square to a diagonally adjacent empty square, opponent pawn on
+            # capturer's old rank disappears.
+            if len(diff_squares) == 3 and len(l) == 1 and len(g) == 1 and len(lost(other)) == 1:
+                fr = l[0]
+                to = g[0]
+                # Sanity: en passant target is diagonally adjacent
+                if abs(fr[0] - to[0]) == 1 and abs(fr[1] - to[1]) == 1:
+                    return {
+                        'from': label_fn(fr[0], fr[1]),
+                        'to': label_fn(to[0], to[1]),
+                        'color': color_str,
+                    }
+
+        # Couldn't reduce: log and skip. (Common: classifier flicker before stability)
+        logger.info(
+            f"Unrecognized diff pattern ({len(diff_squares)} squares): "
+            + ', '.join(f"({label_fn(r, c)} {p}->{n})" for r, c, p, n in diff_squares[:6])
+        )
+        return None
+
+    def detect_move_by_diff(
+        self,
+        warped_board: np.ndarray,
+        diff_threshold: float = 18.0,
+        confirm_frames: int = 2,
+    ) -> Optional[Dict[str, str]]:
+        """
+        Detect a move by comparing current squares to the reference snapshot.
+        A square is "changed" when mean absolute pixel diff exceeds diff_threshold
+        for at least confirm_frames consecutive scans.
+        Returns: {'from': sq, 'to': sq} when exactly 2 squares are persistently changed.
+        """
+        if self.reference_squares is None:
+            return None
+
+        current = self._split_squares(warped_board)
+        ref = self.reference_squares
+        diffs = np.abs(current.astype(np.int16) - ref.astype(np.int16)).mean(axis=(2, 3))
+
+        files = 'abcdefgh'
+
+        def _label(row: int, col: int) -> str:
+            if BOARD_FLIPPED:
+                return f"{files[7 - col]}{row + 1}"
+            return f"{files[col]}{8 - row}"
+
+        changed_now = {(r, c) for r in range(8) for c in range(8) if diffs[r, c] > diff_threshold}
+
+        # Update streaks: increment for currently-changed squares, reset others
+        for key in list(self._change_streak.keys()):
+            if key not in changed_now:
+                del self._change_streak[key]
+        for key in changed_now:
+            self._change_streak[key] = self._change_streak.get(key, 0) + 1
+
+        confirmed = [k for k, n in self._change_streak.items() if n >= confirm_frames]
+
+        if len(confirmed) != 2:
+            if len(confirmed) > 2:
+                logger.debug(f"Too many changed squares ({len(confirmed)}), waiting for stability")
+            return None
+
+        # Geometric sanity check: real chess moves connect from→to via rank, file,
+        # diagonal, or knight L. Reject anything else as camera noise.
+        (r1, c1), (r2, c2) = confirmed
+        dr, dc = abs(r1 - r2), abs(c1 - c2)
+        is_rank_or_file = (dr == 0 or dc == 0)
+        is_diagonal = (dr == dc)
+        is_knight = (dr, dc) in {(1, 2), (2, 1)}
+        if not (is_rank_or_file or is_diagonal or is_knight):
+            logger.info(
+                f"Rejecting non-chess geometry: {_label(r1, c1)} - {_label(r2, c2)} "
+                f"(dr={dr}, dc={dc})"
+            )
+            self._change_streak = {}
+            return None
+
+        # Distinguish from vs. to by mean intensity vs. reference.
+        # Heuristic: 'from' becomes more like the empty-square baseline (less detail),
+        # 'to' gains a piece (often shifts brightness more dramatically).
+        # We use absolute change magnitude — the larger-change square gets 'to' if the
+        # other one's current intensity is closer to reference of that square than ours.
+        a, b = confirmed
+        sq_a = _label(a[0], a[1])
+        sq_b = _label(b[0], b[1])
+
+        # 'from' = square whose current image is most different (piece left, exposing surface)
+        # vs. 'to' = square whose current image gained content
+        # Use variance: 'to' typically has higher variance (piece detail) vs. 'from' (now empty)
+        var_a = float(np.var(current[a[0], a[1]]))
+        var_b = float(np.var(current[b[0], b[1]]))
+
+        if var_a < var_b:
+            move = {'from': sq_a, 'to': sq_b}
+            from_idx, to_idx = a, b
+        else:
+            move = {'from': sq_b, 'to': sq_a}
+            from_idx, to_idx = b, a
+
+        # Identify which piece color moved by sampling the center of the 'to' square.
+        # White wooden pieces are bright; black pieces are dark. We look at the center
+        # to avoid sampling the (lighter or darker) square color around the piece base.
+        to_square_img = current[to_idx[0], to_idx[1]]
+        h, w = to_square_img.shape
+        center_patch = to_square_img[h // 3:2 * h // 3, w // 3:2 * w // 3]
+        center_brightness = float(np.mean(center_patch))
+        # Threshold tuned for wooden boards/pieces; tweak via env if needed.
+        piece_color = 'white' if center_brightness > 110 else 'black'
+        move['color'] = piece_color
+
+        # Refresh the ENTIRE reference to current state. The two moved squares now
+        # match physical reality, and every other square is re-baselined so accumulated
+        # drift (autoexposure, lighting, micro-vibrations) doesn't poison future detections.
+        # This is critical for keeping detection working past the first few moves.
+        self.reference_squares = current.copy()
+        self._change_streak = {}
+
+        logger.info(
+            f"Diff-based move: {move['from']} -> {move['to']} "
+            f"(piece={piece_color}, brightness={center_brightness:.0f}, "
+            f"var_from={min(var_a, var_b):.0f}, var_to={max(var_a, var_b):.0f})"
+        )
+        return move
+
     def detect_move(self, prev_state: np.ndarray, curr_state: np.ndarray) -> Optional[Dict[str, str]]:
         """
         Compare two board states to detect a move
@@ -309,11 +834,17 @@ class ChessCamera:
         if not self.cap.isOpened():
             raise RuntimeError(f"Cannot open camera source: {self.camera_source}")
 
-        # Log camera info
+        # Force a known frame size so frontend click coordinates align with backend pixels.
+        # Frontend handleVideoClick normalizes clicks to 640x480.
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        actual_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
         if isinstance(self.camera_source, int):
-            logger.info(f"Camera {self.camera_source} started")
+            logger.info(f"Camera {self.camera_source} started at {actual_w}x{actual_h}")
         else:
-            logger.info(f"Camera stream started: {self.camera_source}")
+            logger.info(f"Camera stream started at {actual_w}x{actual_h}: {self.camera_source}")
 
     def stop(self):
         """Stop the camera"""
@@ -338,9 +869,9 @@ class ChessCamera:
             self.detector.board_corners = corners
             self.is_calibrated = True
 
-            # Initialize board state
+            # Capture reference snapshot for diff-based detection
             warped = self.detector.extract_board_region(frame, corners)
-            self.detector.previous_board_state = self.detector.detect_pieces(warped)
+            self.detector.set_reference(warped)
 
             logger.info("Board calibrated successfully")
             return True
@@ -372,15 +903,9 @@ class ChessCamera:
                 return None
 
             warped = self.detector.extract_board_region(frame, self.detector.board_corners)
-            current_state = self.detector.detect_pieces(warped)
-
-            move = self.detector.detect_move(
-                self.detector.previous_board_state,
-                current_state
-            )
+            move = self.detector.detect_move_classified(warped)
 
             if move:
-                self.detector.previous_board_state = current_state
                 logger.info(f"Move detected: {move['from']} -> {move['to']}")
 
             return move

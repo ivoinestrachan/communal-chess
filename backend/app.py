@@ -65,7 +65,7 @@ def detection_loop():
                 'from': move['from'],
                 'to': move['to'],
                 'timestamp': time.time()
-            }, broadcast=True)
+            })
 
         time.sleep(0.5)  # Check every 500ms
 
@@ -149,6 +149,34 @@ def get_status():
             'calibrated': camera.is_calibrated if camera else False,
             'detection_active': detection_active
         })
+
+
+@app.route('/api/debug/warped', methods=['GET'])
+def debug_warped():
+    """Save the current warped board image to /tmp/warped_board.png with grid overlay.
+    Use this to verify the 8x8 grid alignment matches the physical squares."""
+    global camera
+
+    if not camera or not camera.is_calibrated or camera.detector.board_corners is None:
+        return jsonify({'success': False, 'error': 'Camera not calibrated'}), 400
+
+    frame = camera.get_frame()
+    if frame is None:
+        return jsonify({'success': False, 'error': 'No frame'}), 500
+
+    warped = camera.detector.extract_board_region(frame, camera.detector.board_corners)
+    overlay = warped.copy()
+    sq = warped.shape[0] // 8
+    for i in range(9):
+        cv2.line(overlay, (i * sq, 0), (i * sq, warped.shape[0]), (0, 255, 0), 1)
+        cv2.line(overlay, (0, i * sq), (warped.shape[1], i * sq), (0, 255, 0), 1)
+
+    cv2.imwrite('/tmp/warped_board.png', overlay)
+    cv2.imwrite('/tmp/warped_board_clean.png', warped)
+    return jsonify({
+        'success': True,
+        'message': 'Saved /tmp/warped_board.png (with grid) and /tmp/warped_board_clean.png'
+    })
 
 
 @app.route('/api/camera/start', methods=['POST'])
@@ -235,11 +263,11 @@ def calibrate():
         corners = np.array(data['corners'], dtype=np.float32)
         camera.detector.board_corners = corners
 
-        # Initialize board state
+        # Capture reference snapshot for diff-based detection
         ret, frame = camera.cap.read()
         if ret:
             warped = camera.detector.extract_board_region(frame, corners)
-            camera.detector.previous_board_state = camera.detector.detect_pieces(warped)
+            camera.detector.set_reference(warped)
             camera.is_calibrated = True
             logger.info("Board calibrated manually with provided corners")
             return jsonify({
@@ -470,4 +498,4 @@ if __name__ == '__main__':
     logger.info("WebSocket endpoint: ws://localhost:5001")
 
     # Run the server
-    socketio.run(app, host='0.0.0.0', port=5001, debug=True, allow_unsafe_werkzeug=True)
+    socketio.run(app, host='0.0.0.0', port=5001, debug=False, use_reloader=False, allow_unsafe_werkzeug=True)
