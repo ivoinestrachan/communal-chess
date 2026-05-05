@@ -1,0 +1,69 @@
+{
+  "description": "Example multi-camera configuration for a communal chess installation",
+  "room_layout": "Cameras positioned around the chess board to ensure continuous visibility even when people walk through",
+
+  "cameras": [
+    {
+      "id": "overhead",
+      "source": 0,
+      "position": "overhead",
+      "priority": 10,
+      "enabled": true,
+      "description": "Top-down view - highest priority, best angle for piece detection"
+    },
+    {
+      "id": "north",
+      "source": 1,
+      "position": "north",
+      "priority": 7,
+      "enabled": true,
+      "description": "North side of board - backup when overhead is blocked"
+    },
+    {
+      "id": "south",
+      "source": 2,
+      "position": "south",
+      "priority": 7,
+      "enabled": true,
+      "description": "South side of board - provides opposite angle from north camera"
+    },
+    {
+      "id": "east",
+      "source": "http://192.168.1.100:8080/video",
+      "position": "east",
+      "priority": 5,
+      "enabled": true,
+      "description": "East side - phone camera using IP Webcam app"
+    },
+    {
+      "id": "west",
+      "source": "http://192.168.1.101:8080/video",
+      "position": "west",
+      "priority": 5,
+      "enabled": true,
+      "description": "West side - another phone camera"
+    }
+  ],
+
+  "notes": {
+    "camera_sources": {
+      "usb_cameras": "Use integers 0, 1, 2, etc. for USB webcams",
+      "phone_cameras": "Use IP Webcam app on Android - URL format: http://PHONE_IP:8080/video",
+      "ip_cameras": "RTSP streams: rtsp://IP:PORT/stream",
+      "meta_rayban": "When available, use companion app to stream to local HTTP endpoint"
+    },
+    "priority_system": {
+      "10": "Best angle (usually overhead)",
+      "7-9": "Good side angles",
+      "5-6": "Acceptable angles for backup",
+      "1-4": "Last resort cameras"
+    },
+    "recommended_setup": [
+      "1 overhead camera (ceiling mount or tripod) - highest priority",
+      "2-4 side cameras at table height",
+      "Position cameras to minimize blind spots",
+      "Ensure at least 2 cameras can see the board at any time",
+      "Test by walking around the board - system should auto-switch cameras"
+    ]
+  }
+}

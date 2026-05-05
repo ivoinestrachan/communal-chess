@@ -11,10 +11,14 @@ import base64
 import numpy as np
 import logging
 from chess_detector import ChessCamera
+from multi_camera_system import MultiCameraChessSystem, CameraConfig
 import threading
 import time
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
@@ -22,30 +26,50 @@ app.config['SECRET_KEY'] = 'your-secret-key-change-in-production'
 CORS(app, resources={r"/*": {"origins": "*"}})
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-# Global camera instance
-camera = None
+# Global camera instances
+camera = None  # Single camera mode (legacy)
+multi_camera_system = None  # Multi-camera mode
 detection_active = False
+use_multi_camera = False  # Toggle between single/multi camera mode
 
 
 def detection_loop():
     """
     Background thread that continuously checks for moves
+    Supports both single-camera and multi-camera modes
     """
-    global camera, detection_active
+    global camera, multi_camera_system, detection_active, use_multi_camera
+
+    logger.info("Detection loop started")
+    scan_count = 0
 
     while detection_active:
-        if camera and camera.is_calibrated:
-            move = camera.detect_move()
+        move = None
+        scan_count += 1
 
-            if move:
-                # Emit move to all connected clients
-                socketio.emit('move_detected', {
-                    'from': move['from'],
-                    'to': move['to'],
-                    'timestamp': time.time()
-                }, broadcast=True)
+        if use_multi_camera and multi_camera_system:
+            # Multi-camera mode: automatically select best camera
+            move = multi_camera_system.detect_move_from_best_camera()
+        elif camera and camera.is_calibrated:
+            # Single camera mode
+            if scan_count % 5 == 1:  # Log every 5th scan to avoid spam
+                logger.info(f"Scan #{scan_count}: Actively scanning for moves...")
+            move = camera.detect_move()
+        else:
+            logger.warning("Camera not calibrated or not available")
+
+        if move:
+            # Emit move to all connected clients
+            logger.info(f"MOVE DETECTED! Emitting: {move['from']} -> {move['to']}")
+            socketio.emit('move_detected', {
+                'from': move['from'],
+                'to': move['to'],
+                'timestamp': time.time()
+            }, broadcast=True)
 
         time.sleep(0.5)  # Check every 500ms
+
+    logger.info("Detection loop stopped")
 
 
 def generate_frames():
@@ -79,35 +103,87 @@ def generate_frames():
         time.sleep(0.033)  # ~30 FPS
 
 
+@app.route('/api/cameras/list', methods=['GET'])
+def list_cameras():
+    """
+    Detect available cameras on the system
+    Returns list of camera indices that can be opened
+    """
+    available_cameras = []
+
+    # Try first 10 camera indices
+    for index in range(10):
+        cap = cv2.VideoCapture(index)
+        if cap.isOpened():
+            # Get camera name if available
+            backend_name = cap.getBackendName()
+            available_cameras.append({
+                'index': index,
+                'name': f'Camera {index}',
+                'backend': backend_name
+            })
+            cap.release()
+
+    return jsonify({
+        'success': True,
+        'cameras': available_cameras
+    })
+
+
 @app.route('/api/status', methods=['GET'])
 def get_status():
     """Get current system status"""
-    return jsonify({
-        'camera_active': camera is not None and camera.cap is not None,
-        'calibrated': camera.is_calibrated if camera else False,
-        'detection_active': detection_active
-    })
+    global camera, multi_camera_system, use_multi_camera
+
+    if use_multi_camera and multi_camera_system:
+        return jsonify({
+            'mode': 'multi_camera',
+            'detection_active': detection_active,
+            'cameras': multi_camera_system.get_all_statuses(),
+            'active_camera': multi_camera_system.active_camera_id
+        })
+    else:
+        return jsonify({
+            'mode': 'single_camera',
+            'camera_active': camera is not None and camera.cap is not None,
+            'calibrated': camera.is_calibrated if camera else False,
+            'detection_active': detection_active
+        })
 
 
 @app.route('/api/camera/start', methods=['POST'])
 def start_camera():
-    """Start the camera"""
+    """
+    Start the camera with flexible source support
+
+    Request JSON params:
+    - camera_source: int (0, 1, 2...) or str (URL for IP camera/stream)
+    - camera_index: int (deprecated, use camera_source instead)
+
+    Examples:
+    {"camera_source": 0}  # Built-in webcam
+    {"camera_source": 1}  # External USB camera
+    {"camera_source": "http://192.168.1.100:8080/video"}  # Phone camera
+    {"camera_source": "rtsp://192.168.1.100:8080/h264"}  # RTSP stream
+    """
     global camera
 
     try:
-        # Get camera index from JSON if provided, otherwise use default
-        camera_index = 0
+        # Get camera source from JSON
+        camera_source = 0  # Default to built-in webcam
         if request.is_json and request.json:
-            camera_index = request.json.get('camera_index', 0)
+            # Support both new 'camera_source' and legacy 'camera_index'
+            camera_source = request.json.get('camera_source',
+                                            request.json.get('camera_index', 0))
 
         if camera is None:
-            camera = ChessCamera(camera_index=camera_index)
+            camera = ChessCamera(camera_source=camera_source)
 
         camera.start()
 
         return jsonify({
             'success': True,
-            'message': 'Camera started successfully'
+            'message': f'Camera started successfully: {camera_source}'
         })
     except Exception as e:
         logger.error(f"Failed to start camera: {e}")
@@ -140,7 +216,10 @@ def stop_camera():
 
 @app.route('/api/calibrate', methods=['POST'])
 def calibrate():
-    """Calibrate the chess board"""
+    """
+    Calibrate the chess board
+    Optionally accepts manual corner coordinates if auto-detection fails
+    """
     global camera
 
     if not camera:
@@ -149,6 +228,26 @@ def calibrate():
             'error': 'Camera not started'
         }), 400
 
+    # Check if manual corners provided
+    data = request.json if request.is_json else None
+    if data and 'corners' in data:
+        # Manual calibration with provided corners
+        corners = np.array(data['corners'], dtype=np.float32)
+        camera.detector.board_corners = corners
+
+        # Initialize board state
+        ret, frame = camera.cap.read()
+        if ret:
+            warped = camera.detector.extract_board_region(frame, corners)
+            camera.detector.previous_board_state = camera.detector.detect_pieces(warped)
+            camera.is_calibrated = True
+            logger.info("Board calibrated manually with provided corners")
+            return jsonify({
+                'success': True,
+                'message': 'Board calibrated manually'
+            })
+
+    # Automatic calibration
     success = camera.calibrate()
 
     if success:
@@ -159,7 +258,7 @@ def calibrate():
 
     return jsonify({
         'success': False,
-        'error': 'Could not detect board. Make sure the entire board is visible.'
+        'error': 'Could not detect board edges automatically. Tips: Ensure good lighting, clear board edges, and full board visibility. You may need to manually select corners.'
     }), 400
 
 
@@ -234,6 +333,135 @@ def handle_frame_request():
             if ret:
                 frame_base64 = base64.b64encode(buffer).decode('utf-8')
                 emit('frame', {'image': frame_base64})
+
+
+# Multi-Camera System Endpoints
+
+@app.route('/api/multi-camera/setup', methods=['POST'])
+def setup_multi_camera():
+    """
+    Setup multi-camera system with multiple camera sources
+
+    Request JSON:
+    {
+        "cameras": [
+            {"id": "north", "source": 0, "position": "north", "priority": 10},
+            {"id": "south", "source": 1, "position": "south", "priority": 8},
+            {"id": "east", "source": "http://192.168.1.100:8080/video", "position": "east", "priority": 5},
+            {"id": "west", "source": 2, "position": "west", "priority": 5}
+        ]
+    }
+    """
+    global multi_camera_system, use_multi_camera, camera
+
+    try:
+        data = request.json
+        if not data or 'cameras' not in data:
+            return jsonify({
+                'success': False,
+                'error': 'Missing cameras configuration'
+            }), 400
+
+        # Create camera configs
+        camera_configs = []
+        for cam_data in data['cameras']:
+            config = CameraConfig(
+                id=cam_data['id'],
+                source=cam_data['source'],
+                position=cam_data.get('position', cam_data['id']),
+                priority=cam_data.get('priority', 5),
+                enabled=cam_data.get('enabled', True)
+            )
+            camera_configs.append(config)
+
+        # Stop single camera if active
+        if camera:
+            camera.stop()
+            camera = None
+
+        # Initialize multi-camera system
+        multi_camera_system = MultiCameraChessSystem(camera_configs)
+        use_multi_camera = True
+
+        # Start all cameras
+        results = multi_camera_system.start_all_cameras()
+
+        return jsonify({
+            'success': True,
+            'message': 'Multi-camera system initialized',
+            'camera_statuses': results
+        })
+
+    except Exception as e:
+        logger.error(f"Failed to setup multi-camera system: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/multi-camera/calibrate', methods=['POST'])
+def calibrate_multi_camera():
+    """Calibrate all cameras in the multi-camera system"""
+    global multi_camera_system
+
+    if not multi_camera_system:
+        return jsonify({
+            'success': False,
+            'error': 'Multi-camera system not initialized'
+        }), 400
+
+    results = multi_camera_system.calibrate_all_cameras()
+
+    # Start monitoring after calibration
+    multi_camera_system.start_monitoring()
+
+    return jsonify({
+        'success': True,
+        'message': 'Cameras calibrated',
+        'calibration_results': results
+    })
+
+
+@app.route('/api/multi-camera/status', methods=['GET'])
+def get_multi_camera_status():
+    """Get detailed status of all cameras"""
+    global multi_camera_system
+
+    if not multi_camera_system:
+        return jsonify({
+            'success': False,
+            'error': 'Multi-camera system not initialized'
+        }), 400
+
+    return jsonify({
+        'success': True,
+        'cameras': multi_camera_system.get_all_statuses(),
+        'active_camera': multi_camera_system.active_camera_id
+    })
+
+
+@app.route('/api/multi-camera/stop', methods=['POST'])
+def stop_multi_camera():
+    """Stop the multi-camera system"""
+    global multi_camera_system, use_multi_camera, detection_active
+
+    if multi_camera_system:
+        detection_active = False
+        multi_camera_system.stop_monitoring()
+        multi_camera_system.stop_all_cameras()
+        multi_camera_system = None
+        use_multi_camera = False
+
+        return jsonify({
+            'success': True,
+            'message': 'Multi-camera system stopped'
+        })
+
+    return jsonify({
+        'success': False,
+        'error': 'No multi-camera system active'
+    }), 400
 
 
 if __name__ == '__main__':

@@ -26,22 +26,54 @@ class ChessBoardDetector:
     def detect_board_corners(self, frame: np.ndarray) -> Optional[np.ndarray]:
         """
         Detect the four corners of the chess board using edge detection
+        Enhanced to work with decorative/ornate boards
         Returns: array of 4 corner points or None
         """
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        # Try multiple edge detection strategies
+        # Strategy 1: Standard Canny with adaptive thresholds
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        edges = cv2.Canny(blur, 50, 150)
+
+        # Calculate adaptive thresholds based on image statistics
+        median = np.median(gray)
+        lower = int(max(0, 0.7 * median))
+        upper = int(min(255, 1.3 * median))
+
+        edges = cv2.Canny(blur, lower, upper)
+
+        # Dilate edges to connect broken lines
+        kernel = np.ones((3, 3), np.uint8)
+        edges = cv2.dilate(edges, kernel, iterations=1)
 
         # Find contours
-        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
 
-        # Find the largest quadrilateral
-        for contour in sorted(contours, key=cv2.contourArea, reverse=True):
-            peri = cv2.arcLength(contour, True)
-            approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
+        # Filter contours by size and shape
+        frame_area = frame.shape[0] * frame.shape[1]
+        min_area = frame_area * 0.1  # Board should be at least 10% of frame
+        max_area = frame_area * 0.9  # But not the entire frame
 
-            if len(approx) == 4:
-                return approx.reshape(4, 2)
+        valid_contours = []
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if min_area < area < max_area:
+                peri = cv2.arcLength(contour, True)
+                # Try different epsilon values for approximation
+                for epsilon_mult in [0.01, 0.02, 0.03, 0.04, 0.05]:
+                    approx = cv2.approxPolyDP(contour, epsilon_mult * peri, True)
+                    if len(approx) == 4:
+                        # Check if it's roughly square-shaped
+                        (x, y, w, h) = cv2.boundingRect(approx)
+                        aspect_ratio = w / float(h) if h > 0 else 0
+                        if 0.7 < aspect_ratio < 1.3:  # Allow some tolerance
+                            valid_contours.append((area, approx))
+                            break
+
+        # Return largest valid quadrilateral
+        if valid_contours:
+            valid_contours.sort(reverse=True, key=lambda x: x[0])
+            return valid_contours[0][1].reshape(4, 2)
 
         return None
 
@@ -128,37 +160,85 @@ class ChessBoardDetector:
         Detect which squares have pieces on them
         Returns: 8x8 array where 1 = piece present, 0 = empty
         """
-        board_state = np.zeros((8, 8), dtype=int)
-        square_size = warped_board.shape[0] // 8
+        try:
+            logger.info(f"detect_pieces called with board shape: {warped_board.shape}")
+            board_state = np.zeros((8, 8), dtype=int)
+            square_size = warped_board.shape[0] // 8
 
-        for row in range(8):
-            for col in range(8):
-                # Extract square region
-                x1 = col * square_size
-                y1 = row * square_size
-                x2 = x1 + square_size
-                y2 = y1 + square_size
+            piece_count = 0
+            for row in range(8):
+                for col in range(8):
+                    # Extract square region
+                    x1 = col * square_size
+                    y1 = row * square_size
+                    x2 = x1 + square_size
+                    y2 = y1 + square_size
 
-                square = warped_board[y1:y2, x1:x2]
+                    square = warped_board[y1:y2, x1:x2]
 
-                # Check if piece is present using color/edge detection
-                if self._has_piece(square):
-                    board_state[row, col] = 1
+                    # Check if piece is present using color/edge detection
+                    if self._has_piece(square):
+                        board_state[row, col] = 1
+                        piece_count += 1
 
-        return board_state
+            logger.info(f"Detected {piece_count} pieces on board")
+            return board_state
+        except Exception as e:
+            logger.error(f"Error in detect_pieces: {e}", exc_info=True)
+            return np.zeros((8, 8), dtype=int)
 
     def _has_piece(self, square_img: np.ndarray) -> bool:
         """
-        Determine if a square contains a piece using simple heuristics
+        Determine if a square contains a piece using multiple detection methods
+        MUCH MORE STRICT for glass boards to avoid false positives
         """
         # Convert to grayscale
         gray = cv2.cvtColor(square_img, cv2.COLOR_BGR2GRAY)
 
-        # Calculate variance - pieces typically have more texture
+        # Method 1: Texture variance (pieces have more detail)
         variance = np.var(gray)
 
-        # Threshold - adjust based on your setup
-        return variance > 200
+        # Method 2: Edge density (pieces have more edges)
+        edges = cv2.Canny(gray, 50, 150)  # Higher thresholds
+        edge_density = np.sum(edges > 0) / edges.size
+
+        # Method 3: Height detection using blur difference
+        blur1 = cv2.GaussianBlur(gray, (5, 5), 0)
+        blur2 = cv2.GaussianBlur(gray, (15, 15), 0)
+        height_hint = np.abs(blur1.astype(float) - blur2.astype(float)).mean()
+
+        # Method 4: Check center region (pieces usually occupy center)
+        h, w = gray.shape
+        center_region = gray[h//4:3*h//4, w//4:3*w//4]
+        center_variance = np.var(center_region)
+
+        # Method 5: Color saturation (pieces might have different color)
+        hsv = cv2.cvtColor(square_img, cv2.COLOR_BGR2HSV)
+        saturation_mean = np.mean(hsv[:, :, 1])
+
+        # Method 6: Brightness difference from edges to center (pieces cast shadows)
+        edge_region = np.concatenate([
+            gray[0:h//4, :].flatten(),
+            gray[3*h//4:h, :].flatten(),
+            gray[:, 0:w//4].flatten(),
+            gray[:, 3*w//4:w].flatten()
+        ])
+        edge_brightness = np.mean(edge_region)
+        center_brightness = np.mean(center_region)
+        brightness_diff = abs(edge_brightness - center_brightness)
+
+        # MUCH MORE STRICT thresholds for glass boards
+        has_texture = variance > 200  # High threshold
+        has_edges = edge_density > 0.08  # Much higher threshold
+        has_height = height_hint > 5  # More strict
+        has_center_detail = center_variance > 150  # Much higher
+        has_color = saturation_mean > 30  # Higher color requirement
+        has_shadow = brightness_diff > 15  # More noticeable shadow required
+
+        # Piece detected if AT LEAST 3 out of 6 methods agree (was 2)
+        score = sum([has_texture, has_edges, has_height, has_center_detail, has_color, has_shadow])
+
+        return score >= 3
 
     def detect_move(self, prev_state: np.ndarray, curr_state: np.ndarray) -> Optional[Dict[str, str]]:
         """
@@ -169,6 +249,10 @@ class ChessBoardDetector:
 
         # Find squares that changed
         changed = np.argwhere(diff != 0)
+
+        # Log detection attempt for debugging
+        if len(changed) > 0:
+            logger.debug(f"Detected {len(changed)} changed squares")
 
         if len(changed) == 2:
             # Exactly 2 squares changed - likely a valid move
@@ -186,7 +270,10 @@ class ChessBoardDetector:
                     move['to'] = square
 
             if 'from' in move and 'to' in move:
+                logger.info(f"Valid move found: {move['from']} -> {move['to']}")
                 return move
+        elif len(changed) > 0:
+            logger.debug(f"Invalid move: {len(changed)} squares changed (expected 2)")
 
         return None
 
@@ -194,20 +281,39 @@ class ChessBoardDetector:
 class ChessCamera:
     """
     Manages camera feed and chess detection
+    Supports multiple camera sources:
+    - Built-in webcam (index 0)
+    - External USB cameras (index 1, 2, etc.)
+    - IP camera streams (RTSP/HTTP URLs)
+    - Phone camera via IP Webcam app
     """
 
-    def __init__(self, camera_index: int = 0):
-        self.camera_index = camera_index
+    def __init__(self, camera_source: int | str = 0):
+        """
+        Initialize camera with flexible source
+
+        Args:
+            camera_source: Can be:
+                - int: Camera index (0 for built-in, 1+ for external)
+                - str: RTSP/HTTP stream URL (e.g., 'rtsp://192.168.1.100:8080/h264')
+                       or IP Webcam URL (e.g., 'http://192.168.1.100:8080/video')
+        """
+        self.camera_source = camera_source
         self.cap = None
         self.detector = ChessBoardDetector()
         self.is_calibrated = False
 
     def start(self):
         """Start the camera"""
-        self.cap = cv2.VideoCapture(self.camera_index)
+        self.cap = cv2.VideoCapture(self.camera_source)
         if not self.cap.isOpened():
-            raise RuntimeError(f"Cannot open camera {self.camera_index}")
-        logger.info(f"Camera {self.camera_index} started")
+            raise RuntimeError(f"Cannot open camera source: {self.camera_source}")
+
+        # Log camera info
+        if isinstance(self.camera_source, int):
+            logger.info(f"Camera {self.camera_source} started")
+        else:
+            logger.info(f"Camera stream started: {self.camera_source}")
 
     def stop(self):
         """Stop the camera"""
@@ -256,22 +362,28 @@ class ChessCamera:
         Returns: dict with 'from' and 'to' squares or None
         """
         if not self.is_calibrated:
+            logger.warning("detect_move called but camera not calibrated")
             return None
 
-        frame = self.get_frame()
-        if frame is None:
+        try:
+            frame = self.get_frame()
+            if frame is None:
+                logger.warning("Could not get frame from camera")
+                return None
+
+            warped = self.detector.extract_board_region(frame, self.detector.board_corners)
+            current_state = self.detector.detect_pieces(warped)
+
+            move = self.detector.detect_move(
+                self.detector.previous_board_state,
+                current_state
+            )
+
+            if move:
+                self.detector.previous_board_state = current_state
+                logger.info(f"Move detected: {move['from']} -> {move['to']}")
+
+            return move
+        except Exception as e:
+            logger.error(f"Error in detect_move: {e}", exc_info=True)
             return None
-
-        warped = self.detector.extract_board_region(frame, self.detector.board_corners)
-        current_state = self.detector.detect_pieces(warped)
-
-        move = self.detector.detect_move(
-            self.detector.previous_board_state,
-            current_state
-        )
-
-        if move:
-            self.detector.previous_board_state = current_state
-            logger.info(f"Move detected: {move['from']} -> {move['to']}")
-
-        return move
