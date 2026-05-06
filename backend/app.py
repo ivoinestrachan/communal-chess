@@ -179,6 +179,99 @@ def debug_warped():
     })
 
 
+@app.route('/api/debug/yolo', methods=['GET'])
+def debug_yolo():
+    """Debug YOLO detection - returns current board state with confidence scores and saves annotated image."""
+    global camera
+
+    if not camera or not camera.is_calibrated or camera.detector.board_corners is None:
+        return jsonify({'success': False, 'error': 'Camera not calibrated'}), 400
+
+    if camera.detector.yolo_detector is None:
+        return jsonify({'success': False, 'error': 'YOLO detector not available'}), 400
+
+    frame = camera.get_frame()
+    if frame is None:
+        return jsonify({'success': False, 'error': 'No frame'}), 500
+
+    warped = camera.detector.extract_board_region(frame, camera.detector.board_corners)
+
+    # Run YOLO with very low confidence to see all detections
+    results = camera.detector.yolo_detector.model(warped, conf=0.01, verbose=False)
+
+    # Draw detections on warped board
+    annotated = warped.copy()
+    sq = warped.shape[0] // 8
+
+    # Draw grid
+    for i in range(9):
+        cv2.line(annotated, (i * sq, 0), (i * sq, warped.shape[0]), (0, 255, 0), 1)
+        cv2.line(annotated, (0, i * sq), (warped.shape[1], i * sq), (0, 255, 0), 1)
+
+    detections = []
+    if results and len(results) > 0 and results[0].boxes is not None:
+        boxes = results[0].boxes
+        for box in boxes:
+            cls = int(box.cls.item())
+            conf = float(box.conf.item())
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            cx = (x1 + x2) / 2.0
+            cy = (y1 + y2) / 2.0
+            col = int(cx // sq)
+            row = int(cy // sq)
+
+            piece_name = camera.detector.yolo_detector.names.get(cls, 'unknown')
+
+            # Draw bounding box
+            color = (0, 255, 0) if conf > 0.2 else (0, 165, 255)  # Green if high conf, orange if low
+            cv2.rectangle(annotated, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+
+            # Draw confidence text
+            label = f"{piece_name[:5]} {conf:.2f}"
+            cv2.putText(annotated, label, (int(x1), int(y1) - 5),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+
+            files = 'abcdefgh'
+            square = f"{files[7-col] if camera.detector.board_corners is not None else files[col]}{row + 1}"
+
+            detections.append({
+                'piece': piece_name,
+                'confidence': conf,
+                'square': square,
+                'bbox': {'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2}
+            })
+
+    cv2.imwrite('/tmp/yolo_detections.png', annotated)
+
+    # Get predicted board state
+    board_state = camera.detector.yolo_detector.predict_board(warped, conf=0.05)
+    board_visual = []
+    for row in range(8):
+        row_str = []
+        for col in range(8):
+            val = board_state[row, col]
+            if val == 0:
+                row_str.append('.')
+            elif val == 1:
+                row_str.append('W')
+            elif val == 2:
+                row_str.append('B')
+        board_visual.append(' '.join(row_str))
+
+    return jsonify({
+        'success': True,
+        'message': 'Saved /tmp/yolo_detections.png',
+        'total_detections': len(detections),
+        'detections': sorted(detections, key=lambda x: -x['confidence']),
+        'board_state': '\n'.join(board_visual),
+        'pieces_detected': {
+            'white': int((board_state == 1).sum()),
+            'black': int((board_state == 2).sum()),
+            'empty': int((board_state == 0).sum())
+        }
+    })
+
+
 @app.route('/api/camera/start', methods=['POST'])
 def start_camera():
     """

@@ -64,28 +64,41 @@ class YOLOPieceDetector:
                 self._class_to_color[idx] = EMPTY  # unexpected class
         logger.info(f"YOLO chess model loaded with {len(self.names)} classes")
 
-    def predict_board(self, warped_board: np.ndarray, conf: float = 0.2) -> np.ndarray:
+    def predict_board(self, warped_board: np.ndarray, conf: float = 0.01) -> np.ndarray:
         """Run YOLO on the warped 800x800 board and return an 8x8 array of
         {EMPTY, WHITE, BLACK} indicating piece color per square.
 
         Each detection is snapped to its nearest grid square by box center.
         If multiple detections fall in the same square (rare), the highest-
         confidence one wins.
+
+        Default conf=0.01 (1%) to catch all pieces - we rely on board-square
+        snapping and chess.js validation, not raw YOLO confidence.
+        Very low threshold needed for non-standard piece designs.
         """
         results = self.model(warped_board, conf=conf, verbose=False)
         board = np.full((8, 8), EMPTY, dtype=np.int8)
         if not results:
+            logger.warning("YOLO returned no results")
             return board
         boxes = results[0].boxes
         if boxes is None or len(boxes) == 0:
+            logger.warning("YOLO returned no boxes")
             return board
 
         sq = warped_board.shape[0] // 8
         # Track best confidence per square so a stronger detection wins
         best_conf = np.zeros((8, 8), dtype=np.float32)
+        total_pieces_detected = 0
 
         for box in boxes:
             cls = int(box.cls.item())
+            piece_name = self.names.get(cls, '')
+
+            # Skip "board" class - we only want individual pieces
+            if piece_name == 'board' or not piece_name.startswith(('white_', 'black_')):
+                continue
+
             conf_score = float(box.conf.item())
             x1, y1, x2, y2 = box.xyxy[0].tolist()
             cx = (x1 + x2) / 2.0
@@ -98,7 +111,9 @@ class YOLOPieceDetector:
             if conf_score > best_conf[row, col]:
                 best_conf[row, col] = conf_score
                 board[row, col] = color
+                total_pieces_detected += 1
 
+        logger.debug(f"YOLO detected {total_pieces_detected} pieces (conf >= {conf})")
         return board
 
 
@@ -225,13 +240,18 @@ class ChessBoardDetector:
         self._pending_change: Optional[Tuple[int, int]] = None  # (changed_count, frame_idx) — unused, see _change_streak
         self._change_streak: Dict[Tuple[int, int], int] = {}  # square -> consecutive-frames-changed
         # Detection: YOLO if model is available, else fall back to per-square kNN.
+        # For now, DISABLE YOLO because it doesn't work well with non-standard pieces
+        # Use kNN classifier instead which learns from YOUR pieces during calibration
         self.yolo_detector: Optional[YOLOPieceDetector] = None
-        if os.path.exists(YOLO_MODEL_PATH):
+        USE_YOLO = os.environ.get('USE_YOLO', '0') == '1'
+        if USE_YOLO and os.path.exists(YOLO_MODEL_PATH):
             try:
                 self.yolo_detector = YOLOPieceDetector()
                 logger.info("Using YOLO chess piece detector")
             except Exception as e:
                 logger.warning(f"YOLO model load failed, falling back to kNN: {e}")
+        else:
+            logger.info("Using kNN classifier (learns from your pieces during calibration)")
         self.classifier = PieceClassifier()
         self.previous_classes: Optional[np.ndarray] = None  # 8x8 of {EMPTY, WHITE, BLACK}
         # Stability gate: only emit a move when the predicted board has been
